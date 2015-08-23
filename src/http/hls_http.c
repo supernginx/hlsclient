@@ -1,0 +1,335 @@
+#include <hls_typedef.h>
+#include <hls_define.h>
+#include <hls_core.h>
+#include <hls_http.h>
+
+static hls_int_t hls_http_parse_url(hls_http_request_t *r, const char *url);
+
+static void hls_http_read_handler(hls_event_t *rev);
+static void hls_http_write_handler(hls_event_t *wev);
+static void hls_http_empty_handler(hls_event_t *ev);
+
+static hls_int_t hls_http_send_request(hls_http_request_t *r);
+static void      hls_http_make_request_url(hls_http_request_t *r);
+static hls_int_t hls_http_process_response_lines(hls_http_request_t *r);
+static void      hls_http_request_handler(hls_event_t *ev);
+static void      hls_http_send_request_handler(hls_http_request_t *r);
+static void      hls_http_process_header(hls_http_request_t *r);
+static hls_int_t hls_http_test_connect(hls_connection_t *c);
+
+hls_http_request_t *hls_http_create_request(hls_log_t *log) {
+    hls_http_request_t    *r;
+    hls_connection_t      *c;
+    hls_event_t           *rev;
+    hls_event_t           *wev;
+
+    c = NULL;
+    rev = wev = NULL;
+    r = NULL;
+
+    r = hls_malloc(sizeof(hls_http_request_t));
+
+    if (r == NULL) {
+        goto failed;
+    }
+
+    c = hls_malloc(sizeof(hls_connection_t));
+    if (c == NULL) {
+        goto failed;
+    }
+
+    rev = hls_malloc(sizeof(hls_event_t));
+    if (rev == NULL) {
+        goto failed;
+    }
+
+    wev = hls_alloc(sizeof(hls_event_t));
+    if (wev == NULL) {
+        goto failed;
+    }
+
+    memset(r, 0, sizeof(hls_http_request_t));
+    r->connection = c;
+    r->log = log;
+    
+    memset(c, 0, sizeof(hls_connection_t));
+    c->read = rev;
+    c->write = wev;
+    c->data = r;
+    c->log = log;
+    c->active = 1;
+
+    memset(rev, 0, sizeof(hls_event_t));
+    rev->handler = hls_http_read_handler;
+    rev->log = log;
+    rev->data = c;
+    
+    memset(wev, 0, sizeof(hls_event_t));
+    wev->write = 1;
+    wev->handler = hls_http_empty_handler;
+    wev->log = log;
+    wev->data = c;
+
+    r->connect_timeout = 10000;
+    r->rw_timeout = 10000;
+
+    return r;
+
+failed:
+
+    if (r) {
+        hls_free(r);
+    }
+    if (c) {
+        hls_free(c);
+    }
+    if (rev) {
+        hls_free(rev);
+    }
+    if (wev) {
+        hls_free(wev);
+    }
+
+    return NULL;
+}
+
+hls_int_t hls_http_request(hls_http_request_t *r, const char *url) {
+    hls_int_t    rc;
+
+    rc = hls_http_parse_url(r, url);
+    if (rc == HLS_ERROR) {
+        return HLS_ERROR;
+    }
+
+    rc = hls_http_send_request(r);
+
+    return rc; 
+}
+
+hls_int_t hls_http_parse_url(hls_http_request_t *r, const char *url) {
+    hls_int_t            rc;
+    char                *p, *str, *host;
+    size_t               len;
+    hls_connection_t    *c;
+    struct sockaddr_in  *sockin;
+
+    p = (char *)url;
+    c = r->connection;
+
+    str = strstr(p, "//");
+
+    if (str == NULL) {
+        hls_log_error(HLS_LOG_ALERT, r->log, 0, "%s is invalid string", url);
+        return HLS_ERROR;
+    }
+
+    len = str - p;
+    r->schema_start = p;
+    r->schema_end = p+len+2;
+
+    if ((strncmp(p, "http:", 5) != 0)
+        || (strncmp(p, "https:", 6) != 0)) {
+        hls_log_error(HLS_LOG_ALERT, r->log, 0, "%s is invalid string", url);
+        return HLS_ERROR;
+    }
+
+    p += len+2;
+    r->http_procotol.len = len+2;
+    r->http_protocol.data = malloc(len+2);
+    if (r->http_protocol.data == NULL) {
+        hls_log_error(HLS_LOG_ALERT, r->log, 0, "out of memory");
+        return HLS_ERROR;
+    }
+    strncpy(r->http_protocol.data, url, len+2);
+
+    /* get host and port */
+    str = strchr(p, '/');
+    if (str == NULL) {
+        hls_log_error(HLS_LOG_ALERT, r->log, 0, "%s is not found domain or ip", url);
+        return HLS_ERROR;
+    }
+    len = str - p;
+    host = strchr(p, ':');
+    if (host == NULL) {
+        r->host.len = len;
+        r->host.data = malloc(len+1);
+        if (r->host.data == NULL) {
+            hls_log_error(HLS_LOG_ALERT, r->log, 0, "out of memory");
+            return HLS_ERROR;
+        }
+        strncpy(r->host.data, p, len);
+        r->host.data[len] = '\0';
+        r->port = 80;
+        r->host_start = p;
+        r->host_end = p + len;
+        r->port_start = r->port_end = NULL;
+    } else {
+        size_t    host_len;
+        char      port_str[6];
+        
+        host_len = host - p;
+        r->host.len = len;
+        r->host.data = malloc(host_len+1);
+        if (r->host.data == NULL) {
+            hls_log_error(HLS_LOG_ALERT, r->log, 0, "out of memory");
+            return NULL;
+        }
+        strncpy(r->host.data, p, host_len);
+        r->host.data[host_len] = '\0';
+        r->host_start = p;
+        r->host_end = p + host_len;
+
+        p += host_len + 1;
+ 
+        strncpy(port_str, p, len-host_len);
+        port_str[len-host_len] = '\0';
+        r->port = atoi(port_str);
+        r->port_start = p;
+        r->port_end = p + len-host_len; 
+    }
+    
+    hls_log_debug(HLS_LOG_DEBUG, r->log, 0, "http request uri, host: %s port: %d", r->host.data, r->port);
+    
+    sockin = (struct sockaddr_in*)c->sockaddr;
+    if (inet_aton(r->host.data, &sockin->sin_addr) != 0) {
+
+        sockin->sin_addr.s_addr = inet_addr(r->host.data);
+        sockin->sa_family = AF_INET;
+        sockin->sin_port = htons(r->port);
+    } else {
+        struct hostent     *peer_host;
+        char               *peer_ip;
+        struct in_addr     *in;
+
+        peer_host = gethostbyname(r->host.data);
+        in = (struct in_addr*)peer_host->h_addr;
+        peer_ip = inet_ntoa(*in);
+        
+        sockin->sin_addr.s_addr = inet_addr(peer_ip);
+        sockin->sa_family = AF_INET;
+        sockin->sin_port = htons(r->port);
+    }
+    c->socklen = sizeof(struct sockaddr);
+
+    p += len+1;
+
+    str = strrchr(p, '/');
+    if (str == NULL) {
+        hls_log_error(HLS_LOG_ALERT, r->log, 0, "%s is not found filename", url);
+        return HLS_ERROR;
+    }
+    p = str+1;
+    
+    r->uri_start = url;
+    r->uri_end = p;
+
+    str = strchr(p, '.');
+    if (strcmp(str, ".m3u8") != 0) {
+        hls_log_error(HLS_LOG_ALERT, r->log, 0, "%s is not an m3u8 file", url);
+        return HLS_ERROR;
+    }
+    
+    len = strlen(p);
+    strncpy(r->filename, p, len);
+    r->filename[len] = '\0';
+
+    len = strlen(url);
+    r->uri.data = malloc(len);
+    if (r->uri.data == NULL) {
+        hls_log_error(HLS_LOG_ALERT, r->log, 0, "out of memory");
+        return HLS_ERROR;
+    }
+    strncpy(r->uri.data, url, len);
+    r->data.len = len;
+
+    return HLS_OK;
+}
+
+static hls_int_t hls_http_send_request(hls_http_request_t *r) {
+    hls_int_t            rc;
+    hls_connection_t    *c;
+
+    c = r->connection;
+
+    rc = hls_event_connect_peer(c);
+
+    if (rc == HLS_ERROR) {
+        hls_destroy_request(r);
+        return HLS_ERROR;
+    }
+
+    c->write->handler = hls_http_request_handler;
+    c->read->handler = hls_http_request_handler;
+    r->write_event_handler = hls_http_send_request_handler;
+    r->read_event_handler = hls_http_process_header;
+
+    if (rc == HLS_AGAIN) {
+        hls_add_timer(c->write, r->connect_timeout);
+        return HLS_AGAIN;
+    }
+
+    r->request_sent = 1;
+    c->write->handler = hls_http_empty_handler;
+
+    rc = c->send(c, c->buffer->buf, c->buffer->len);
+
+    if (rc == HLS_AGAIN) {
+        hls_add_timer(c->write, r->rw_timeout);
+        c->write->handler = hls_http_write_handler;
+		if (hls_handle_write_event(c->write, 0) != HLS_OK) {
+			r->rc = HLS_HTTP_INTERNAL_CLIENT_ERROR;
+		    hls_destroy_request(r);
+			return HLS_ERROR;
+		}
+
+        return HLS_AGAIN;
+    }
+
+    return rc;
+}
+
+static void hls_http_request_handler(hls_event_t *ev) {
+    hls_connection_t        *c;
+    hls_http_request_t      *r;
+
+    c = ev->data;
+    r = c->data;
+    
+    if (ev->write) {
+        r->write_event_handler(r);
+    } else {
+        r->read_event_handler(r);
+    }
+}
+
+static void hls_http_send_request_handler(hls_http_request_t *r) {
+    hls_connection_t        *c;
+	hls_int_t                rc;
+
+	c = r->connection;
+
+    if (!r->request_sent) {
+        if (hls_http_test_connect(c) != HLS_OK) {
+			r->rc = HLS_CONNECT_SERVER_ERROR;
+			hls_destroy_request(r);
+		    return;
+		}
+		r->request_sent = 1;
+	}
+
+    rc = c->send(c, c->buffer->buf+c->sent, c->buffer->len-c->sent);
+
+	if (rc == HLS_ERROR) {
+	    hls_destroy_request(r);
+        return;
+	}
+
+	if (rc == HLS_AGAIN) {
+	    hls_add_timer(c->write, r->rw_timeout);
+        c->write->handler = hls_http_write_handler;
+		if (hls_handle_write_event(c->write, 0) != HLS_OK) {
+			r->rc = HLS_HTTP_INTERNAL_CLIENT_ERROR;
+		    hls_destroy_request(r);
+		}
+	}
+}
